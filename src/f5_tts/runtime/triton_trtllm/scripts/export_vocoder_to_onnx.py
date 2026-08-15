@@ -76,13 +76,14 @@ class VocosVocoder(nn.Module):
 
 
 def export_VocosVocoder(vocos_vocoder, output_path, verbose):
-    vocos_vocoder = VocosVocoder(vocos_vocoder).cuda()
+    # NOTE(sm_120): CPU 导出（torch 2.6 无 RTX 5080 CUDA kernel），结果与 GPU 导出一致
+    vocos_vocoder = VocosVocoder(vocos_vocoder).cpu()
     vocos_vocoder.eval()
 
     dummy_batch_size = 8
     dummy_input_length = 500
 
-    dummy_mel = torch.randn(dummy_batch_size, 100, dummy_input_length).cuda()
+    dummy_mel = torch.randn(dummy_batch_size, 100, dummy_input_length).cpu()
 
     with torch.no_grad():
         dummy_waveform = vocos_vocoder(mel=dummy_mel)

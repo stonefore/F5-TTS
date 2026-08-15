@@ -1,6 +1,8 @@
 # Customed
 .vscode/
 tests/
+!src/f5_tts/runtime/triton_trtllm/tests/
+!src/f5_tts/runtime/triton_trtllm/tests/*.py
 runs/
 data/
 ckpts/

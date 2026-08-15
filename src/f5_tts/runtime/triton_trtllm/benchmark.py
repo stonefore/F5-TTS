@@ -164,7 +164,7 @@ def data_collator(batch, vocab_char_map, device="cuda", use_perf=False):
 
         if use_perf:
             torch.cuda.nvtx.range_push(f"mel_spectrogram {i}")
-        ref_audio = ref_audio.to("cuda")
+        # NOTE(sm_120): torch 2.6 无 RTX 5080 CUDA kernel，mel 计算在 CPU
         ref_mel = get_vocos_mel_spectrogram(ref_audio).squeeze(0)
         if use_perf:
             torch.cuda.nvtx.range_pop()
@@ -357,11 +357,12 @@ def main():
 
     if args.enable_warmup:
         for batch in dataloader:
-            ref_mels, ref_mel_lens = batch["ref_mel_batch"].to(device), batch["ref_mel_len_batch"].to(device)
-            text_pad_seq = batch["text_pad_sequence"].to(device)
-            total_mel_lens = batch["estimated_reference_target_mel_len"]
-            cond_pad_seq = F.pad(ref_mels, (0, 0, 0, max(total_mel_lens) - ref_mels.shape[1], 0, 0))
             if args.backend_type == "trt":
+                # NOTE(sm_120): TRT 模式全流程 CPU（torch 2.6 无 RTX 5080 kernel）
+                ref_mels, ref_mel_lens = batch["ref_mel_batch"], batch["ref_mel_len_batch"]
+                text_pad_seq = batch["text_pad_sequence"]
+                total_mel_lens = batch["estimated_reference_target_mel_len"]
+                cond_pad_seq = F.pad(ref_mels, (0, 0, 0, max(total_mel_lens) - ref_mels.shape[1], 0, 0))
                 _ = model.sample(
                     text_pad_seq,
                     cond_pad_seq,
@@ -370,6 +371,10 @@ def main():
                     remove_input_padding=args.remove_input_padding,
                 )
             elif args.backend_type == "pytorch":
+                ref_mels, ref_mel_lens = batch["ref_mel_batch"].to(device), batch["ref_mel_len_batch"].to(device)
+                text_pad_seq = batch["text_pad_sequence"].to(device)
+                total_mel_lens = batch["estimated_reference_target_mel_len"]
+                cond_pad_seq = F.pad(ref_mels, (0, 0, 0, max(total_mel_lens) - ref_mels.shape[1], 0, 0))
                 total_mel_lens = torch.tensor(total_mel_lens, device=device)
                 with torch.inference_mode():
                     generated, _ = model.sample(
@@ -393,10 +398,17 @@ def main():
     for batch in dataloader:
         if args.use_perf:
             torch.cuda.nvtx.range_push("data sample")
-        ref_mels, ref_mel_lens = batch["ref_mel_batch"].to(device), batch["ref_mel_len_batch"].to(device)
-        text_pad_seq = batch["text_pad_sequence"].to(device)
-        total_mel_lens = batch["estimated_reference_target_mel_len"]
-        cond_pad_seq = F.pad(ref_mels, (0, 0, 0, max(total_mel_lens) - ref_mels.shape[1], 0, 0))
+        if args.backend_type == "trt":
+            # NOTE(sm_120): TRT 模式全流程 CPU（torch 2.6 无 RTX 5080 kernel）
+            ref_mels, ref_mel_lens = batch["ref_mel_batch"], batch["ref_mel_len_batch"]
+            text_pad_seq = batch["text_pad_sequence"]
+            total_mel_lens = batch["estimated_reference_target_mel_len"]
+            cond_pad_seq = F.pad(ref_mels, (0, 0, 0, max(total_mel_lens) - ref_mels.shape[1], 0, 0))
+        else:
+            ref_mels, ref_mel_lens = batch["ref_mel_batch"].to(device), batch["ref_mel_len_batch"].to(device)
+            text_pad_seq = batch["text_pad_sequence"].to(device)
+            total_mel_lens = batch["estimated_reference_target_mel_len"]
+            cond_pad_seq = F.pad(ref_mels, (0, 0, 0, max(total_mel_lens) - ref_mels.shape[1], 0, 0))
         if args.use_perf:
             torch.cuda.nvtx.range_pop()
         if args.backend_type == "trt":
@@ -432,7 +444,11 @@ def main():
             if args.vocoder == "vocos":
                 if args.use_perf:
                     torch.cuda.nvtx.range_push("vocoder decode")
-                generated_wave = vocoder.decode(gen_mel_spec).cpu()
+                if args.backend_type == "trt":
+                    # NOTE(sm_120): TRT 模式 gen 为 CPU 张量，搬运到 GPU 供 vocoder engine 使用
+                    generated_wave = vocoder.decode(gen_mel_spec.contiguous().cuda()).cpu()
+                else:
+                    generated_wave = vocoder.decode(gen_mel_spec).cpu()
                 if args.use_perf:
                     torch.cuda.nvtx.range_pop()
             else:
