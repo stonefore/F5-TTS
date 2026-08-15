@@ -20,7 +20,7 @@ import time
 
 import torch
 import torch.nn.functional as F
-import torchaudio
+import soundfile as sf
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(_HERE)                    # tests/ (for model_repo_f5_tts)
@@ -81,7 +81,8 @@ def get_args():
 
 
 def prepare_sample(audio_path, ref_text, target_text, max_prompt_sec=None):
-    wav, sr = torchaudio.load(audio_path)
+    wav_np, sr = sf.read(audio_path)
+    wav = torch.from_numpy(wav_np).unsqueeze(0).float()  # [1, N]
     if max_prompt_sec is not None:
         wav = wav[:, : int(max_prompt_sec * sr)]
     rms = torch.sqrt(torch.mean(torch.square(wav)))
@@ -113,12 +114,13 @@ def main():
         vocab_size=vocab_size,
     )
     vocoder = VocosTensorRT(engine_path=args.vocoder_trt_engine_path)
+    device = torch.device("cuda")
 
     # warmup
     for _ in range(2):
-        ref_mel = torch.randn(100, 300)
-        text = torch.randint(1, 2000, (1, 30))
-        model.sample(text, ref_mel.unsqueeze(0).transpose(1, 2), torch.tensor([100]), [300])
+        ref_mel = torch.randn(100, 300, device=device)
+        text = torch.randint(1, 2000, (1, 30), device=device)
+        model.sample(text, ref_mel.unsqueeze(0).transpose(1, 2), torch.tensor([100], device=device), [300])
 
     rows = []
     for audio_path, ref_text, target_text in SAMPLES:
@@ -126,16 +128,16 @@ def main():
             audio_path, ref_text, target_text, args.max_prompt_sec
         )
         pinyin = convert_char_to_pinyin([full_text], polyphone=True)
-        text_idx = list_str_to_idx(pinyin, vocab_char_map)
+        text_idx = list_str_to_idx(pinyin, vocab_char_map).to(device)
 
-        mel_batch = padded_mel_batch([ref_mel])  # [1, T, 100]
+        mel_batch = padded_mel_batch([ref_mel]).to(device)  # [1, T, 100]
         cond = F.pad(mel_batch, (0, 0, 0, est_len - mel_batch.shape[1], 0, 0))
 
         t0 = time.time()
-        denoised, _ = model.sample(text_idx, cond, torch.tensor([ref_mel_len]), [est_len])
+        denoised, _ = model.sample(text_idx, cond, torch.tensor([ref_mel_len], device=device), [est_len])
         gen = denoised[0, ref_mel_len:est_len, :].unsqueeze(0)
-        gen_mel = gen.permute(0, 2, 1).to(torch.float32).contiguous()  # CPU 连续化（GPU contiguous 需 kernel）
-        wave = vocoder.decode(gen_mel.cuda()).cpu()
+        gen_mel = gen.permute(0, 2, 1).to(torch.float32).contiguous()  # GPU 连续化
+        wave = vocoder.decode(gen_mel).cpu()
         elapsed = time.time() - t0
         dur = wave.shape[1] / TARGET_SR
         rows.append((audio_path, ref_mel_len, est_len, elapsed, dur))

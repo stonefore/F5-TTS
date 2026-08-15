@@ -216,15 +216,13 @@ class F5TTS(object):
             self.debug_tensors = list(set(found_tensor_names) - set(expected_tensor_names))
 
         self.max_mel_len = 4096
-        # NOTE(sm_120): torch 2.6 (TRT-LLM ABI 兼容版) 无 RTX 5080 CUDA kernel，
-        # 文本编码器等 PyTorch 计算全部保留在 CPU，GPU 仅用于 TRT engine 执行与张量搬运。
         self.text_embedding = TextEmbedding(
             text_num_embeds=vocab_size,
             text_dim=config["pretrained_config"]["text_dim"],
             mask_padding=config["pretrained_config"]["text_mask_padding"],
             conv_layers=config["pretrained_config"]["conv_layers"],
             precompute_max_pos=self.max_mel_len,
-        )  # 留在 CPU
+        ).to(self.device)
         self.text_embedding.load_state_dict(get_text_embed_dict(model_path), strict=True)
 
         self.n_mel_channels = config["pretrained_config"]["mel_dim"]
@@ -235,10 +233,10 @@ class F5TTS(object):
         inv_freq = 1.0 / (base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
         freqs = torch.outer(torch.arange(self.max_mel_len, dtype=torch.float32), inv_freq) / self.interpolation_factor
         self.freqs = freqs.repeat_interleave(2, dim=-1).unsqueeze(0)
-        self.rope_cos = self.freqs.cos().half()  # 留在 CPU，使用时搬运
+        self.rope_cos = self.freqs.cos().half()
         self.rope_sin = self.freqs.sin().half()
 
-        self.nfe_steps = int(os.environ.get("F5TTS_NFE", "32"))
+        self.nfe_steps = 32
         epss = {
             5: [0, 2, 4, 8, 16, 32],
             6: [0, 2, 4, 6, 8, 16, 32],
@@ -259,8 +257,8 @@ class F5TTS(object):
         for i in range(self.nfe_steps):
             emb = time_step[i] * emb_factor
             time_expand[:, i, :] = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        self.time_expand = time_expand  # 留在 CPU，使用时搬运
-        self.delta_t = torch.cat((delta_t, delta_t), dim=0).contiguous()  # 留在 CPU
+        self.time_expand = time_expand.to(self.device)
+        self.delta_t = torch.cat((delta_t, delta_t), dim=0).contiguous().to(self.device)
 
     def _tensor_dtype(self, name):
         # return torch dtype given tensor name for convenience
@@ -307,8 +305,6 @@ class F5TTS(object):
         delta_t: torch.Tensor,
         use_perf: bool = False,
     ):
-        # NOTE(sm_120): 输入均为 CPU 张量。所有 PyTorch 计算在 CPU 完成，
-        # GPU 仅用于 TRT engine 执行与输入/输出张量搬运。
         if use_perf:
             torch.cuda.nvtx.range_push("flow matching")
         cfg_strength = 2.0
@@ -318,32 +314,34 @@ class F5TTS(object):
 
         input_type = str_dtype_to_torch(self.dtype)
 
-        # CPU 上完成类型转换后一次性搬运到 GPU（每步只搬运变化的部分）
-        cond_gpu = cond.to(input_type).to(self.device)
-        rope_cos_gpu = rope_cos.to(input_type).to(self.device)
-        rope_sin_gpu = rope_sin.to(input_type).to(self.device)
-        input_lengths_gpu = input_lengths.to(str_dtype_to_torch("int32")).to(self.device)
+        # Keep a copy of the initial tensors
+        cond = cond.to(input_type)
+        rope_cos = rope_cos.to(input_type)
+        rope_sin = rope_sin.to(input_type)
+        input_lengths = input_lengths.to(str_dtype_to_torch("int32"))
 
+        # Instead of iteratively updating noise within a single model context,
+        # we'll do a single forward pass for each iteration with fresh context setup
         for i in range(self.nfe_steps):
             # Re-setup the buffers for clean execution
             self._setup(batch_size, noise.shape[1])
             if not self.buffer_allocated:
                 raise RuntimeError("Buffer not allocated, please call setup first!")
 
-            # Re-create combined noises for this iteration (CPU)
+            # Re-create combined noises for this iteration
             current_noise = torch.cat([noise_half, noise_half], dim=0).to(input_type)
 
-            # Get time step for this iteration (CPU)
+            # Get time step for this iteration
             current_time = time_expand[:, i].to(input_type)
 
             # Create fresh input dictionary for this iteration
             current_inputs = {
-                "noise": current_noise.to(self.device),
-                "cond": cond_gpu,
-                "time": current_time.to(self.device),
-                "rope_cos": rope_cos_gpu,
-                "rope_sin": rope_sin_gpu,
-                "input_lengths": input_lengths_gpu,
+                "noise": current_noise,
+                "cond": cond,
+                "time": current_time,
+                "rope_cos": rope_cos,
+                "rope_sin": rope_sin,
+                "input_lengths": input_lengths,
             }
 
             # Update inputs and set shapes
@@ -358,12 +356,12 @@ class F5TTS(object):
             # self.session.context.execute_async_v3(self.stream.cuda_stream)
             if use_perf:
                 torch.cuda.nvtx.range_pop()
-            # Process results (搬回 CPU 计算，torch 2.6 无 sm_120 kernel)
+            # Process results
             t_scale = delta_t[i].unsqueeze(0).to(input_type)
 
             # Extract predictions
-            pred_cond = self.outputs["denoised"][:half_batch].cpu()
-            pred_uncond = self.outputs["denoised"][half_batch:].cpu()
+            pred_cond = self.outputs["denoised"][:half_batch]
+            pred_uncond = self.outputs["denoised"][half_batch:]
 
             # Apply classifier-free guidance with safeguards
             guidance = pred_cond + (pred_cond - pred_uncond) * cfg_strength
@@ -387,20 +385,16 @@ class F5TTS(object):
         batch = text_pad_sequence.shape[0]
         max_seq_len = cond_pad_sequence.shape[1]
 
-        # NOTE(sm_120): 全部计算在 CPU 完成（torch 2.6 无 RTX 5080 kernel），GPU 仅执行 TRT engine
-        text_pad_sequence = text_pad_sequence.cpu()
-        cond_pad_sequence = cond_pad_sequence.cpu()
-
         # get text_embed one by one to avoid misalignment
         text_and_drop_embedding_list = []
         for i in range(batch):
             text_embedding_i = self.text_embedding(
-                text_pad_sequence[i].unsqueeze(0),
+                text_pad_sequence[i].unsqueeze(0).to(self.device),
                 estimated_reference_target_mel_len[i],
                 drop_text=False,
             )
             text_embedding_drop_i = self.text_embedding(
-                text_pad_sequence[i].unsqueeze(0),
+                text_pad_sequence[i].unsqueeze(0).to(self.device),
                 estimated_reference_target_mel_len[i],
                 drop_text=True,
             )
@@ -415,8 +409,8 @@ class F5TTS(object):
         text_embedding = text_and_drop_embedding[0::2]
         text_embedding_drop = text_and_drop_embedding[1::2]
 
-        noise = torch.randn_like(cond_pad_sequence)  # CPU
-        rope_cos = self.rope_cos[:, :max_seq_len, :].float().repeat(batch, 1, 1)  # CPU
+        noise = torch.randn_like(cond_pad_sequence).to(self.device)
+        rope_cos = self.rope_cos[:, :max_seq_len, :].float().repeat(batch, 1, 1)
         rope_sin = self.rope_sin[:, :max_seq_len, :].float().repeat(batch, 1, 1)
 
         cat_mel_text = torch.cat(
@@ -428,13 +422,13 @@ class F5TTS(object):
         )
         cat_mel_text_drop = torch.cat(
             (
-                torch.zeros((batch, max_seq_len, self.n_mel_channels), dtype=torch.float32),
+                torch.zeros((batch, max_seq_len, self.n_mel_channels), dtype=torch.float32).to(self.device),
                 text_embedding_drop,
             ),
             dim=-1,
         )
 
-        time_expand = self.time_expand.repeat(2 * batch, 1, 1).contiguous()  # CPU
+        time_expand = self.time_expand.repeat(2 * batch, 1, 1).contiguous()
 
         # Convert estimated_reference_target_mel_len to tensor
         input_lengths = torch.tensor(estimated_reference_target_mel_len, dtype=torch.int32)
@@ -462,6 +456,8 @@ class F5TTS(object):
             inputs["rope_sin"] = remove_tensor_padding(inputs["rope_sin"], inputs["input_lengths"])
         if use_perf and remove_input_padding:
             torch.cuda.nvtx.range_pop()
+        for key in inputs:
+            inputs[key] = inputs[key].to(self.device)
         if use_perf:
             torch.cuda.nvtx.range_pop()
         start_time = time.time()

@@ -3,6 +3,60 @@
 > 测试日期：2026-08-15 ｜ 本机实测（RTX 5080 / WSL2）
 > 相关代码：`src/f5_tts/runtime/triton_trtllm/`
 > 加速原理文档见：`docs/triton_trtllm_acceleration_zh.md`
+> ⚡ **2026-08-15 更新：升级 TRT-LLM 1.2.1 后加速效果达成，见第 8 章**
+
+---
+
+## 8. 【更新】TRT-LLM 1.2.1 升级：加速效果达成 ✅
+
+### 8.1 升级内容
+
+| 组件 | 旧（无加速） | 新（✅ 加速） |
+|---|---|---|
+| TensorRT-LLM | 0.19.0.dev2025031800（wheel 来自 HF 社区仓库） | **1.2.1**（wheel 来自 NVIDIA 官方源 `pypi.nvidia.com`，cp310，2.5 GB） |
+| TensorRT | 10.8 / 10.9 | **10.14.1.48** |
+| PyTorch | 2.6.0+cu124（无 sm_120 kernel，需 CPU 绕行） | **2.9.1+cu130**（原生 sm_120 kernel，全 GPU） |
+| 引擎构建 | 默认配置 | **默认 + `--gemm_plugin auto --bert_attention_plugin float16`** |
+
+关键发现：TRT-LLM 1.x 的 wheel 其实一直在 NVIDIA 官方 PyPI 源上（`pip install tensorrt_llm==1.2.1 --extra-index-url https://pypi.nvidia.com`），此前 0.20 找不到是查询方式问题；1.2.1 依赖 torch 2.9.1（cu130）与 CUDA 13 库（`nvidia/cu13` 新目录结构），并需要 `CUDA_HOME` 环境变量（指向伪 CUDA 目录即可）与 `apache-tvm-ffi`、`llguidance`、`mistral_common` 等新依赖。
+
+### 8.2 引擎性能（单步，batch=2 CFG 双分支）
+
+| 序列长度 N | 0.19/TRT10.8 | 1.2.1 基础 | **1.2.1 + 插件** | PyTorch 2.8 原生 |
+|---|---|---|---|---|
+| 870 | 21.4 ms | 22.3 ms | **12.6 ms** | ~15 ms |
+| 1400 | 42.6 ms | 27.6 ms | **18.2 ms** | ~25 ms |
+| 1840 | 60.3 ms | 33.9 ms | **24.5 ms** | ~33 ms |
+
+### 8.3 端到端 RTF（8 条本地样本，RTX 5080 / WSL2）
+
+| 模式 | 32 NFE | 16 NFE |
+|---|---|---|
+| **TRT-LLM 1.2.1 + 插件（最终）** | **RTF 0.0686** | **RTF 0.0683** |
+| TRT-LLM 1.2.1 基础引擎 | 0.1008 | 0.0949 |
+| TRT-LLM 0.19（旧，CPU 绕行） | 0.1702 | 0.0903 |
+| PyTorch 2.8 原生（对照） | 0.1151 | 0.0734 |
+
+**结论：TRT-LLM 1.2.1 优化引擎相对 PyTorch 原生加速约 40%（0.0686 vs 0.1151）**，且 16/32 NFE 耗时几乎持平——说明当前瓶颈已转移到固定开销（文本编码 ~178 ms + 声码器），DiT 引擎本身 32 步仅约 0.6 s（N=1400）。进一步优化方向：文本编码器（PyTorch 部分）合并 cond/uncond 两次计算、批量推理、或将其并入引擎。
+
+### 8.4 复现命令
+
+```bash
+# 环境：conda env f5trtllm121（python 3.10 + torch 2.9.1+cu130 + TRT-LLM 1.2.1 + TRT 10.14）
+source /tmp/env_f5_121.sh   # 含 CUDA_HOME、LD_LIBRARY_PATH（nvidia/cu13、tensorrt_libs 等）
+
+# 引擎构建（关键：加插件选项）
+trtllm-build --checkpoint_dir ckpts/F5TTS_v1_Base/trtllm_ckpt_v121 \
+    --max_batch_size 8 --output_dir ckpts/F5TTS_v1_Base/trtllm_engine_v121_opt \
+    --remove_input_padding disable --gemm_plugin auto --bert_attention_plugin float16
+
+# 基准测试
+python src/f5_tts/runtime/triton_trtllm/tests/benchmark_local.py \
+    --model-path ckpts/F5TTS_v1_Base/model_1250000.safetensors \
+    --vocab-file ckpts/F5TTS_v1_Base/vocab.txt \
+    --tllm-model-dir ckpts/F5TTS_v1_Base/trtllm_engine_v121_opt \
+    --vocoder-trt-engine-path ckpts/vocos_vocoder_v121.plan
+```
 
 ---
 
